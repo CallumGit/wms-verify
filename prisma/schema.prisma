@@ -1,0 +1,347 @@
+// ============================================================================
+// WMS Verify — Prisma schema
+// Baza: PostgreSQL. Źródło prawdy dla typów domeny.
+// Komentarze techniczne EN; wartości/komunikaty domenowe obsługiwane przez i18n (pl).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN       // pełne uprawnienia, konfiguracja harmonogramu raportów
+  SUPERVISOR  // podgląd, raporty na żądanie, konfiguracja raportów
+  OPERATOR    // weryfikacja palet i zamówień
+}
+
+enum OrderStatus {
+  NEW              // utworzone, brak weryfikacji
+  IN_PROGRESS      // część palet zweryfikowana
+  VERIFIED         // wszystkie palety zweryfikowane, gotowe do wysyłki
+  SHIPPED          // wysłane
+  CANCELLED
+}
+
+enum PalletStatus {
+  PENDING          // oczekuje na weryfikację
+  IN_PROGRESS      // weryfikacja w toku (część detali)
+  VERIFIED         // zweryfikowana poprawnie
+  FAILED           // weryfikacja nieudana (niezgodność)
+  SHIPPED
+}
+
+enum VerificationResult {
+  PASS
+  FAIL
+}
+
+enum InputSource {
+  BARCODE          // zeskanowany kod kreskowy
+  QR               // zeskanowany kod QR
+  OCR              // rozpoznany z aparatu (grawer)
+  MANUAL           // wprowadzony ręcznie (fallback, wymaganie e)
+}
+
+enum SyncStatus {
+  PENDING          // zapisane lokalnie, oczekuje na wysłanie
+  SYNCED           // potwierdzone przez backend
+  CONFLICT         // konflikt przy synchronizacji
+}
+
+enum ReportType {
+  ORDER_SUMMARY        // podsumowanie realizacji zamówień
+  SHIPMENT_SUMMARY     // podsumowanie wysyłek
+  PALLET_DETAIL        // szczegóły palet
+}
+
+enum ReportFormat {
+  PDF
+  XLSX
+}
+
+enum ReportTrigger {
+  ON_DEMAND        // wygenerowany ręcznie
+  SCHEDULED        // wygenerowany przez harmonogram (wymaganie j)
+}
+
+// ----------------------------------------------------------------------------
+// AUTH & USERS  (moduł: auth)
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String
+  fullName     String
+  role         UserRole @default(OPERATOR)
+  isActive     Boolean  @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  verifications     PalletVerification[] @relation("VerifiedBy")
+  reports           Report[]             @relation("RequestedBy")
+  reportSchedules   ReportSchedule[]     @relation("ConfiguredBy")
+  auditLogs         AuditLog[]
+
+  @@index([role])
+}
+
+// ----------------------------------------------------------------------------
+// MASTER DATA  (moduł: master-data, wymaganie d)
+// ----------------------------------------------------------------------------
+
+// Klient/firma. Kod np. "101-2-018" (firma + oddział).
+model Customer {
+  id            String   @id @default(uuid())
+  code          String   @unique          // np. "101-2-018"
+  companyName   String
+  branchName    String?                   // oddział
+  address       String?
+  city          String?
+  postalCode    String?
+  country       String?  @default("PL")
+  contactEmail  String?
+  contactPhone  String?
+  isActive      Boolean  @default(true)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  orders        Order[]
+
+  @@index([code])
+}
+
+// Materiał/detal. Kod np. "119-01". Ten sam numer jest grawerowany na detalu.
+model Material {
+  id            String   @id @default(uuid())
+  code          String   @unique          // np. "119-01"
+  name          String
+  description   String?
+  hasQrLabel    Boolean  @default(false)  // nie zakładamy QR na każdym detalu
+  isActive      Boolean  @default(true)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  pallets       Pallet[]
+  engravings    EngravingRecord[]
+
+  @@index([code])
+}
+
+// ----------------------------------------------------------------------------
+// ORDERS & PALLETS  (moduł: orders, wymagania f, g)
+// ----------------------------------------------------------------------------
+
+model Order {
+  id             String      @id @default(uuid())
+  orderNumber    String      @unique
+  status         OrderStatus @default(NEW)
+
+  customerId     String
+  customer       Customer    @relation(fields: [customerId], references: [id])
+
+  // Pełny kod z etykiety, np. "101-2-018-119-01" (klient + materiał).
+  fullClientCode String?
+
+  expectedPallets Int        @default(0)
+
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  shippedAt      DateTime?
+
+  pallets        Pallet[]
+  reports        Report[]
+
+  @@index([status])
+  @@index([customerId])
+}
+
+model Pallet {
+  id               String       @id @default(uuid())
+  // Numer HU (Storage Unit Number) — etykieta wewnętrzna i wysyłkowa (wymaganie b)
+  huNumber         String       @unique
+  status           PalletStatus @default(PENDING)
+
+  orderId          String
+  order            Order        @relation(fields: [orderId], references: [id])
+
+  materialId       String
+  material         Material     @relation(fields: [materialId], references: [id])
+
+  expectedQuantity Int          // oczekiwana liczba detali na palecie
+  verifiedQuantity Int          @default(0)
+
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  verifiedAt       DateTime?
+  shippedAt        DateTime?
+
+  verifications    PalletVerification[]
+  engravings       EngravingRecord[]
+
+  @@index([orderId])
+  @@index([status])
+  @@index([huNumber])
+}
+
+// ----------------------------------------------------------------------------
+// VERIFICATION  (moduły: verification, recognition, sync — wymagania a–e, h)
+// ----------------------------------------------------------------------------
+
+// Pojedyncza próba weryfikacji palety (jedna sesja operatora).
+model PalletVerification {
+  id                 String             @id @default(uuid())
+
+  // Idempotentność dla synchronizacji offline (wymaganie h).
+  // Generowany na urządzeniu; backend odrzuca duplikaty.
+  clientGeneratedId  String             @unique
+
+  palletId           String
+  pallet             Pallet             @relation(fields: [palletId], references: [id])
+
+  verifiedById       String
+  verifiedBy         User               @relation("VerifiedBy", fields: [verifiedById], references: [id])
+
+  result             VerificationResult
+  failureReason      String?            // klucz i18n lub opis niezgodności
+
+  // Wartości odczytane podczas weryfikacji
+  scannedHuNumber    String?
+  scannedMaterialCode String?
+  scannedClientCode  String?            // pełny kod np. "101-2-018-119-01"
+
+  huSource           InputSource?
+  materialSource     InputSource?
+  clientCodeSource   InputSource?
+
+  syncStatus         SyncStatus         @default(PENDING)
+
+  // Znaczniki czasu — lokalny (urządzenie) i serwerowy
+  startedAt          DateTime?
+  completedAt        DateTime?
+  syncedAt           DateTime?
+  createdAt          DateTime           @default(now())
+
+  engravings         EngravingRecord[]
+
+  @@index([palletId])
+  @@index([verifiedById])
+  @@index([result])
+  @@index([syncStatus])
+}
+
+// Pojedynczy odczyt grawera z detalu (wymagania a, c, e).
+model EngravingRecord {
+  id                 String              @id @default(uuid())
+
+  verificationId     String
+  verification       PalletVerification  @relation(fields: [verificationId], references: [id], onDelete: Cascade)
+
+  palletId           String
+  pallet             Pallet              @relation(fields: [palletId], references: [id])
+
+  materialId         String?
+  material           Material?           @relation(fields: [materialId], references: [id])
+
+  engravingNumber    String              // odczytany numer grawera
+  source             InputSource         // OCR / MANUAL / QR
+  ocrConfidence      Float?              // pewność OCR (null dla MANUAL)
+  photoUri           String?             // referencja do zdjęcia (jeśli zapisane)
+  matched            Boolean             @default(false) // zgodny z oczekiwanym materiałem
+
+  createdAt          DateTime            @default(now())
+
+  @@index([verificationId])
+  @@index([palletId])
+  @@index([engravingNumber])
+}
+
+// ----------------------------------------------------------------------------
+// REPORTING  (moduł: reporting — wymagania i, j)
+// ----------------------------------------------------------------------------
+
+model Report {
+  id            String        @id @default(uuid())
+  type          ReportType
+  format        ReportFormat
+  trigger       ReportTrigger
+
+  // Zakres danych
+  rangeFrom     DateTime?
+  rangeTo       DateTime?
+  orderId       String?
+  order         Order?        @relation(fields: [orderId], references: [id])
+
+  requestedById String?
+  requestedBy   User?         @relation("RequestedBy", fields: [requestedById], references: [id])
+
+  scheduleId    String?
+  schedule      ReportSchedule? @relation(fields: [scheduleId], references: [id])
+
+  fileUri       String?       // ścieżka do wygenerowanego pliku
+  status        String        @default("PENDING") // PENDING | GENERATING | READY | FAILED
+
+  createdAt     DateTime      @default(now())
+  generatedAt   DateTime?
+
+  @@index([type])
+  @@index([trigger])
+  @@index([createdAt])
+}
+
+// Konfiguracja automatycznego generowania raportów (wymaganie j).
+// Tylko użytkownicy z uprawnieniami (ADMIN/SUPERVISOR).
+model ReportSchedule {
+  id             String        @id @default(uuid())
+  name           String
+  type           ReportType
+  format         ReportFormat  @default(PDF)
+
+  // Harmonogram w formacie CRON (np. "0 6,18 * * *" — 6:00 i 18:00)
+  cronExpression String
+  timezone       String        @default("Europe/Warsaw")
+  isActive       Boolean       @default(true)
+
+  configuredById String
+  configuredBy   User          @relation("ConfiguredBy", fields: [configuredById], references: [id])
+
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  lastRunAt      DateTime?
+  nextRunAt      DateTime?
+
+  reports        Report[]
+
+  @@index([isActive])
+}
+
+// ----------------------------------------------------------------------------
+// AUDIT  (przekrojowo — ślad działań użytkowników)
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  action      String   // np. "PALLET_VERIFIED", "ORDER_SHIPPED", "REPORT_SCHEDULED"
+  entityType  String?  // np. "Pallet", "Order"
+  entityId    String?
+  metadata    Json?    // dodatkowy kontekst
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}

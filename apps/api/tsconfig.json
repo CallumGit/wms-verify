@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "target": "ES2022",
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "references": [{ "path": "../../packages/core" }, { "path": "../../packages/types" }],
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test"]
+}

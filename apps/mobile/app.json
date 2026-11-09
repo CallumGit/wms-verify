@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "WMS Verify",
+    "slug": "wms-verify",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "platforms": ["android"],
+    "android": {
+      "package": "com.wmsverify.app",
+      "permissions": ["CAMERA"]
+    },
+    "locales": {
+      "pl": "./src/i18n/expo-pl.json"
+    }
+  }
+}
